@@ -1,0 +1,64 @@
+
+// code gửi dữ liệu lên server rồi server đẩy lên app
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// Thông tin Wi-Fi
+const char* ssid = "Thu Son";
+const char* password = "12341234";
+
+// Địa chỉ IP hoặc tên miền của server Flask
+const String serverURL = "http://192.168.1.14:5000/esp-data";  // Thay <your-server-ip> bằng địa chỉ IP của server Flask
+
+void setup() {
+  // Khởi tạo kết nối Serial
+  Serial.begin(115200);
+
+  // Kết nối Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi!");
+
+  // Gửi dữ liệu tới server Flask
+  sendFallData(true);  // Giả sử phát hiện ngã (fall_detect = 1)
+}
+
+void loop() {
+  // Có thể thêm logic để gửi dữ liệu theo thời gian thực
+}
+
+// Hàm gửi dữ liệu tới server Flask
+void sendFallData(bool fall_detect) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    // Cấu hình URL và phương thức HTTP POST
+    http.begin(serverURL);
+    http.addHeader("Content-Type", "application/json");
+
+    // Tạo JSON payload
+    String payload = "{\"fall_detect\": " + String(fall_detect) + "}";
+
+    // Gửi POST request
+    int httpResponseCode = http.POST(payload);
+
+    // Kiểm tra phản hồi từ server
+    if (httpResponseCode > 0) {
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+      String response = http.getString();
+      Serial.println("Response: " + response);
+    } else {
+      Serial.print("Error on sending POST request. HTTP error code: ");
+      Serial.println(httpResponseCode);
+    }
+
+    // Đóng kết nối
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+}

@@ -1,0 +1,45 @@
+from flask import Flask, request, jsonify
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+# Khởi tạo Flask
+app = Flask(__name__)
+
+# Load Firebase Admin SDK
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred)
+
+@app.route("/esp-data", methods=["POST"])
+def receive_data():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    fall_detect = data.get("fall_detect")
+
+    if fall_detect == 1:
+        # Gửi FCM nếu phát hiện ngã
+        message = messaging.Message(
+            topic="fall_alert",
+            notification=messaging.Notification(
+                title="Cảnh báo ngã!",
+                body="Phát hiện người dùng bị ngã!",
+            ),
+            android=messaging.AndroidConfig(
+                notification=messaging.AndroidNotification(
+                     priority="high", 
+                     channel_id="fall_channel" , # PHẢI trùng với bên Flutter
+                    sound="warning"  # Âm thanh tuỳ chỉnh nếu có
+                )
+            ),
+        )
+        response = messaging.send(message)
+        print("FCM sent:", response)
+
+        return jsonify({"message": "Fall detected, FCM sent!"}), 200
+    else:
+        return jsonify({"message": "No fall detected"}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)

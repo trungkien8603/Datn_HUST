@@ -1,0 +1,165 @@
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
+import 'dart:convert'; // 👈 Quan trọng cho jsonDecode
+
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+FlutterLocalNotificationsPlugin();
+
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+  _showNotification(message);
+}
+
+void _showNotification(RemoteMessage message) async {
+  const androidDetails = AndroidNotificationDetails(
+    'fall_channel',
+    'Cảnh báo ngã',
+    channelDescription: 'Kênh cảnh báo khi phát hiện ngã',
+    importance: Importance.max,
+    priority: Priority.high,
+    playSound: true,
+    sound: RawResourceAndroidNotificationSound('warning'),
+  );
+  const notificationDetails = NotificationDetails(android: androidDetails);
+  await flutterLocalNotificationsPlugin.show(
+    0,
+    message.notification?.title ?? 'Thông báo',
+    message.notification?.body ?? '',
+    notificationDetails,
+  );
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  const initSettings = InitializationSettings(android: androidInit);
+  await flutterLocalNotificationsPlugin.initialize(initSettings);
+
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'FCM + MQTT Demo',
+      home: FCMHomePage(),
+    );
+  }
+}
+
+class FCMHomePage extends StatefulWidget {
+  @override
+  _FCMHomePageState createState() => _FCMHomePageState();
+}
+
+class _FCMHomePageState extends State<FCMHomePage> {
+  String? _token;
+  String heartRate = "-";
+  String spo2 = "-";
+
+  late MqttServerClient client;
+
+  @override
+  void initState() {
+    super.initState();
+    _setupFCM();
+    _connectToMQTT();
+  }
+
+  Future<void> _setupFCM() async {
+    NotificationSettings settings =
+    await FirebaseMessaging.instance.requestPermission();
+
+    print('🔐 Notification permission: ${settings.authorizationStatus}');
+    _token = await FirebaseMessaging.instance.getToken();
+    print('📱 FCM Token: $_token');
+    await FirebaseMessaging.instance.subscribeToTopic("fall_alert");
+
+    FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+      print('📩 [Foreground] Notification: ${message.notification?.title}');
+      _showNotification(message);
+    });
+  }
+
+  void _connectToMQTT() async {
+    client = MqttServerClient('192.168.1.14', 'flutter_client_${DateTime.now().millisecondsSinceEpoch}');
+    client.port = 1883;
+    client.keepAlivePeriod = 20;
+    client.logging(on: false);
+    client.onDisconnected = () {
+      print('❌ MQTT disconnected');
+    };
+
+    final connMess = MqttConnectMessage()
+        .withClientIdentifier('flutter_client')
+        .startClean()
+        .withWillQos(MqttQos.atMostOnce);
+    client.connectionMessage = connMess;
+
+    try {
+      await client.connect();
+    } catch (e) {
+      print('❌ MQTT Connect error: $e');
+      client.disconnect();
+      return;
+    }
+
+    if (client.connectionStatus!.state == MqttConnectionState.connected) {
+      print('✅ MQTT Connected');
+      client.subscribe('health_data', MqttQos.atMostOnce);
+
+      client.updates!.listen((List<MqttReceivedMessage<MqttMessage>> c) {
+        final recMess = c[0].payload as MqttPublishMessage;
+        final payload =
+        MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+        print('📩 MQTT Received: $payload');
+
+        try {
+          final data = jsonDecode(payload);
+          setState(() {
+            heartRate = data['heart_rate'].toString();
+            spo2 = data['spo2'].toString();
+          });
+        } catch (e) {
+          print('❌ JSON Parse error: $e');
+        }
+      });
+    } else {
+      print('❌ MQTT Failed connection');
+      client.disconnect();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Cảnh báo FCM + Dữ liệu MQTT'),
+      ),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text('❤️ Nhịp tim: $heartRate', style: TextStyle(fontSize: 22)),
+            SizedBox(height: 10),
+            Text('🩸 SpO2: $spo2%', style: TextStyle(fontSize: 22)),
+            SizedBox(height: 20),
+            Padding(
+              padding: EdgeInsets.all(12),
+              child: SelectableText('🔑 FCM Token:\n$_token'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,817 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/timer.h"
+#include <math.h>
+#include "soc/timer_group_struct.h"
+#include "soc/timer_group_reg.h"
+#include <NTPClient.h>
+#include <DFRobot_MAX30102.h>
+#include <PubSubClient.h>
+#include<Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HTTPUpdate.h>
+
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+
+const char* serviceUUID = "12345678-1234-5678-1234-56789abcdef0";
+const char* charUUID    = "abcdef01-1234-5678-1234-56789abcdef0";
+
+// Thông số cảm biến MPU6050
+#define FALL_THRESHOLD 5.0   // Ngưỡng rơi tự do (m/s^2)
+#define ANGLE_THRESHOLD 60.0 // Ngưỡng góc nghiêng (độ)
+
+// WiFi & Firebase
+// #define WIFI_SSID "Tang 3"
+// #define WIFI_PASSWORD "iloveyou"
+// #define FIREBASE_SECRET "IurUT7cyMoKG4ZPQj16iZuZLRFQuyoXGfZDY1ywa"
+// #define FIREBASE_HOST  "firstproject-f55ec-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+#define ANALOG_PIN 34 // Chân analog để đọc dung lượng pin
+#define STATUS_PIN 16
+
+#define DOUBLE_CLICK_INTERVAL_MS 500  // 500ms trong khoảng double click
+volatile uint32_t lastButtonPressTime = 0;
+volatile bool waitingSecondClick = false;
+
+
+
+// const String serverURL = "https://datn-kientrung.onrender.com/esp-data";  // Flask server URL
+
+
+// ======= MQTT config =======
+const char* mqtt_server = "192.168.1.35"; // Địa chỉ máy chủ MQTT
+const int mqtt_port = 1883; 
+const char* mqtt_topic = "health_data";
+
+
+bool deviceConnected = false;
+bool wifiConnected = false;
+bool bleStarted = false;
+String receivedSSID = "";
+String receivedPASS = "";
+bool credentialsReady = false;
+volatile bool buttonHeld = false;
+
+volatile bool isTimerActive = false; // Trạng thái của timer (đang chạy hay không)
+float acc, angle_x = 0, angle_y = 0; // Góc từ gyro
+float accel_roll = 0, accel_pitch = 0; // Góc từ accelerometer
+float angleY_t = 0, angleX_t = 0; // Góc từ accelerometer
+float dt = 0.5;
+bool http_initialized = false; // Biến kiểm tra trạng thái HTTP
+volatile int fallStatus = 0; // Trạng thái ngã (true nếu ngã, false nếu không ngã)
+bool hasInterrupt = false;
+float G_x2, G_y2, G_z2; // Biến lưu trữ giá trị gia tốc từ cảm biến MPU6050
+
+
+const int pwmPin = 18;      // Chân xuất PWM
+const int freq = 2700;     // Tần số 1kHz
+const int pwmChannel = 0;  // Kênh PWM (0-15)
+const int resolution = 8;  // Độ phân giải 8 bit (0-255)
+
+
+int8_t SPO2Valid; //Flag to display if SPO2 calculation is valid
+int8_t heartRateValid; //Flag to display if heart-rate calculation is valid 
+
+
+typedef struct {
+    int32_t SPO2; //SPO2
+    int32_t heartRate; //Heart-rate
+  } SensorData;
+SensorData data; // Biến để lưu dữ liệu cảm biến
+// Cảm biến MPU6050
+Adafruit_MPU6050 mpu;
+// HTTPClient http; // Đối tượng HTTPClient để gửi dữ liệu đến Firebase
+
+// ======= Clients =======
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Timer cấu hình
+hw_timer_t *timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+// Biến dùng để báo task thực thi
+volatile bool doTask = false;
+
+// Queue để truyền trạng thái ngã
+QueueHandle_t fallQueue, dataQueue = xQueueCreate(1, sizeof(SensorData));;
+SemaphoreHandle_t interruptSemaphore, buzzerSemaphore,timerSemaphore; // Semaphore để đồng bộ hóa giữa các task
+// Tạo EventGroup
+EventGroupHandle_t taskDone;
+// Định nghĩa các bit
+#define TASK_WIFI_BIT (1 << 0)  // 0x01
+#define TASK_MEASURESENSOR_BIT (1 << 1)  // 0x02
+#define TASK_SEND_DATA_BIT (1 << 2)  // 0x04
+#define ALL_TASKS_DONE (TASK_WIFI_BIT | TASK_MEASURESENSOR_BIT | TASK_SEND_DATA_BIT)
+
+#define INTERRUPT_PIN 4  // Chân ngắt bất kỳ
+#define buzzerPinInterupt 17 // Chân ngawt phát âm thanh
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600, 60000); // Cập nhật mỗi phút
+
+DFRobot_MAX30102 particleSensor;
+#define WAKEUP_TIMER_MS 25  // ví dụ: 25 giây
+#define TIME_TO_SLEEP_US WAKEUP_TIMER_MS * 1000000ULL // 25 giây
+
+
+bool sensorState = true;       // true = cảm biến đang bật
+bool sleepByButton = false;    // true nếu sleep là do nhấn nút
+
+
+// Khai báo handle để quản lý các task
+TaskHandle_t wifiTaskHandle = NULL;
+TaskHandle_t detectFallTaskHandle = NULL;
+TaskHandle_t sendDataTaskHandle = NULL;
+TaskHandle_t measureHeartSpo2TaskHandle = NULL;
+TaskHandle_t sleepTaskHandle = NULL;
+
+void detectFallTask(void *parameter);
+void sendDataTask(void *parameter);
+void measureHeart_Spo2(void *parameter);
+void stopWarning(void *parameter);
+void wifiTask(void* pvParameters);
+// void sleepTask(void* pvParameters);
+
+
+void IRAM_ATTR handleInterrupt_mpu6050() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(interruptSemaphore, NULL);
+    
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Cho phép chuyển context ngay
+}
+void IRAM_ATTR handleInterrupt_buzzer() {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xSemaphoreGiveFromISR(buzzerSemaphore, NULL); // Gọi semaphore để phát âm thanh 
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Cho phép chuyển context ngay
+}
+
+
+
+
+float statuspin() {
+    int analogValue = analogRead(ANALOG_PIN); // Đọc giá trị từ chân analog
+    float batteryVoltage = (analogValue - 2812) / 9.51;
+    // Trả về trạng thái của chân pin
+    return batteryVoltage; // Trả về giá trị đã chuyển đổi
+  }
+// ham tat am thanh
+void stopBuzzer() {
+    ledcWrite(pwmChannel, 0);        // Tắt xung
+    ledcDetachPin(pwmPin);           // Gỡ PWM khỏi chân
+    pinMode(pwmPin, OUTPUT);
+    digitalWrite(pwmPin, LOW);       // Đưa chân về LOW để tiết kiệm pin
+  }
+//ham bat am thanh
+ void startBuzzer(uint32_t duty) {
+    ledcAttachPin(pwmPin, pwmChannel);            // Gắn lại chân vào PWM
+    ledcWrite(pwmChannel, duty);                  // Bật lại với duty mong muốn
+  }
+
+  // ISR: ngắt mỗi 25 giây
+void IRAM_ATTR onTimer() {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(timerSemaphore, &xHigherPriorityTaskWoken);
+  if (xHigherPriorityTaskWoken) {
+    portYIELD_FROM_ISR();
+  }
+}
+// init timer
+void timerSetup(int interval) {
+ // Tạo semaphore nhị phân
+  timerSemaphore = xSemaphoreCreateBinary();
+
+  // Tạo timer: timer 0, prescaler 80 → tick = 1us
+  timer = timerBegin(0, 80, true);  // true = count up
+
+  // Gắn hàm ngắt
+  timerAttachInterrupt(timer, &onTimer, true);
+
+  // Đặt thời gian ngắt mỗi 25 giây = 25.000.000 micro giây
+  timerAlarmWrite(timer, interval, true);
+  timerAlarmEnable(timer);
+}
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    Serial.println("[BLE] Client connected");
+    startBuzzer(126); // Buzzer kêu khi có kết nối
+    delay(100);
+    stopBuzzer(); // Tắt âm thanh
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    Serial.println("[BLE] Client disconnected");
+  }
+};
+
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    String value = String(pChar->getValue().c_str());
+    Serial.print("[BLE] Data received: ");
+    Serial.println(value);
+
+    int ssidStart = value.indexOf("SSID:") + 5;
+    int ssidEnd = value.indexOf(";PASS:");
+    int passStart = value.indexOf("PASS:") + 5;
+
+    if (ssidStart > 4 && ssidEnd > ssidStart && passStart > 4) {
+      receivedSSID = value.substring(ssidStart, ssidEnd);
+      receivedPASS = value.substring(passStart);
+      credentialsReady = true;
+      Serial.println("[BLE] Credentials stored. WiFi task will handle connection.");
+    } else {
+      Serial.println("[BLE] Invalid format");
+      pChar->setValue("INVALID");
+      pChar->notify();
+    }
+  }
+};
+
+// ==== BLE FUNCTIONS ====
+
+void startBLE() {
+  if (bleStarted) return;
+  Serial.println("[BLE] Starting BLE...");
+
+  BLEDevice::init("ESP32-BLE-WiFi");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(serviceUUID);
+  pCharacteristic = pService->createCharacteristic(charUUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+
+  pService->start();
+  BLEDevice::getAdvertising()->start();
+  bleStarted = true;
+}
+
+void stopBLE() {
+  if (!bleStarted) return;
+  Serial.println("[BLE] Stopping BLE...");
+  BLEDevice::getAdvertising()->stop();
+  pServer->disconnect(0);  // Disconnect client
+  bleStarted = false;
+}
+
+
+
+
+  // ham ket noi wifi
+// void connectToWiFi() {
+//     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+//     while (WiFi.status() != WL_CONNECTED) {
+//         delay(500);
+//         Serial.print(".");
+//     }
+//     Serial.println("WiFi connected");
+// }
+
+// ====== MQTT ======
+void connectToMQTT() {
+    Serial.print("Kết nối MQTT...");
+    while (!mqttClient.connected()) {
+      if (mqttClient.connect("ESP32_Client")) {
+        Serial.println("✅ MQTT đã kết nối!");
+      } else {
+        Serial.print("❌ Lỗi MQTT, mã lỗi: ");
+        Serial.print(mqttClient.state());
+        Serial.println(". Thử lại sau 2s...");
+        delay(2000);
+      }
+    }
+  }
+
+  // ====== HTTP POST fall_detect ======
+// void sendFallData(int fall_detect) {
+//     // if (WiFi.status() == WL_CONNECTED) {
+//       HTTPClient http;
+//       http.begin(serverURL);
+//       http.addHeader("Content-Type", "application/json");
+  
+//    String payload = String("{\"fall_detect\": ") + String(fall_detect ? 1 : 0) + "}";
+
+//       int httpResponseCode = http.POST(payload);
+  
+//       if (httpResponseCode > 0) {
+//         Serial.print("✅ HTTP Response: ");
+//         Serial.println(http.getString());
+//       } else {
+//         Serial.print("❌ HTTP Error: ");
+//         Serial.println(httpResponseCode);
+//       }
+//       http.end();
+//     // } else {
+//     //   Serial.println("❌ Mất WiFi, không gửi được HTTP.");
+//     // }
+//   }
+
+  // ====== MQTT publish ======
+  void sendMQTTData(int spo2, int heartRate, int fallStatus) {
+    if (mqttClient.connected()) {
+      String payload = "{\"spo2\": " + String(spo2) +
+                       ", \"heartRate\": " + String(heartRate) +
+                       ", \"fallStatus\": " + String(fallStatus) + "}";
+  
+      bool sent = mqttClient.publish(mqtt_topic, payload.c_str());
+      Serial.println(sent ? "✅ MQTT OK" : "❌ MQTT FAIL");
+      Serial.println("Payload: " + payload);
+    } else {
+      Serial.println("❌ MQTT not connected");
+    }
+  }
+
+//   void sendMQTTData_test(float acc, float angle_x, float angle_y, float angle_z) {
+//   if (mqttClient.connected()) {
+//     String payload = "{\"acc\": " + String(acc, 2) + 
+//                      ", \"G_x2\": " + String(G_x2, 2) + 
+//                      ", \"G_y2\": " + String(G_y2, 2) +
+//                      ", \"G_z2\": " + String(G_y2, 2) + "}";
+
+//     bool sent = mqttClient.publish(mqtt_topic, payload.c_str());
+//     Serial.println(sent ? "✅ MQTT OK" : "❌ MQTT FAIL");
+//     Serial.println("Payload: " + payload);
+//   } else {
+//     Serial.println("❌ MQTT not connected");
+//   }
+// }
+
+void initMax30102(bool enable){
+    if(enable) {
+     
+        particleSensor.wakeUp();     
+    } else {
+        // Tắt cảm biến: tắt LED để tiết kiệm năng lượng
+        particleSensor.shutDown();  // gọi hàm shutDown nếu thư viện hỗ trợ
+        Serial.println("MAX30102 Disabled (Shutdown mode)");
+    }
+}
+
+
+//cam bien mpu6050
+void initMPU6050(bool enable){
+    if(enable) {
+        // Bật và khởi tạo MPU6050
+        if (!mpu.begin()) {
+            Serial.println("Failed to find MPU6050 chip");
+            while (1) { delay(10); }
+        }
+        Serial.println("MPU6050 Found!");
+        // Cấu hình cảm biến khi bật
+        mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
+        mpu.setMotionDetectionThreshold(50); // 25 LSB = 0.25g
+        mpu.setMotionDetectionDuration(50);
+        mpu.setInterruptPinLatch(true);
+        mpu.setInterruptPinPolarity(true);
+        mpu.setMotionInterrupt(true);
+        mpu.enableSleep(false);               // Bật cảm biến (không cho sleep)
+        mpu.setClock(MPU6050_PLL_GYROX);
+        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    } else {
+        // Tắt cảm biến bằng cách cho sleep mode
+        mpu.enableSleep(true);
+        Serial.println("MPU6050 Disabled (Sleep Mode Enabled)");
+    }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  // timerSetup(25000000); // Khởi ngắt timer
+  taskDone = xEventGroupCreate(); // Tạo EventGroup để quản lý task
+  // Đặt chế độ WiFi là STA (Station)
+  WiFi.mode(WIFI_STA);
+  pinMode(STATUS_PIN,OUTPUT);
+   mqttClient.setServer(mqtt_server, mqtt_port);
+   // Cấu hình chân GPIO để làm ngắt đánh thức 
+  pinMode(INTERRUPT_PIN, INPUT_PULLUP);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_4, 0);
+  
+    // Cấu hình RTC timer wake-up
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_US);
+        // Khởi tạo PWM
+        ledcSetup(pwmChannel, freq, resolution);
+        ledcAttachPin(pwmPin, pwmChannel);
+        ledcWrite(pwmChannel, 0);  
+          startBuzzer(126); 
+          delay(300);
+          stopBuzzer();
+  // KHÔNG xóa thông tin mạng cũ
+  WiFi.begin();  // Tự động kết nối lại với WiFi đã lưu
+
+  Serial.println("[WiFi] Đang thử kết nối WiFi đã lưu...");
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 5000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Đã kết nối thành công!");
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+    startBuzzer(126); // Buzzer kêu khi kết nối thành công
+    delay(500);
+    stopBuzzer(); // Tắt âm thanh
+    wifiConnected = true;
+    connectToMQTT(); // Kết nối MQTT ngay nếu đã có WiFi
+     
+   
+  } else {
+    startBuzzer(126); // Buzzer kêu khi không kết nối được
+    delay(300);
+    stopBuzzer(); // Tắt âm thanh
+     delay(300);
+    startBuzzer(126); // Buzzer kêu khi không kết nối được
+    delay(300);
+    stopBuzzer(); // Tắt âm thanh
+     delay(300);
+     startBuzzer(126); // Buzzer kêu khi không kết nối được
+    delay(300);
+    stopBuzzer(); // Tắt âm thanh
+
+    Serial.println("\n[WiFi] Kết nối thất bại. Bật BLE để nhận cấu hình mới...");
+    startBLE(); // Bật BLE nếu kết nối thất bại
+  }
+ 
+  // Bật cảm biến và khởi tạo
+        while (!particleSensor.begin()) {
+            Serial.println("MAX30102 was not found");
+            delay(1000);
+        }
+        Serial.println("MAX30102 Found!");
+        // Cấu hình cảm biến
+        particleSensor.sensorConfiguration(
+            /*ledBrightness=*/0xA0, // Độ sáng LED (0x0F = 100%)
+            /*sampleAverage=*/SAMPLEAVG_8,
+            /*ledMode=*/MODE_MULTILED, 
+            /*sampleRate=*/SAMPLERATE_100,
+            /*pulseWidth=*/PULSEWIDTH_411, 
+            /*adcRange=*/ADCRANGE_16384
+        );
+         
+  initMPU6050(true); // Bật cảm biến MPU6050
+ 
+
+  // Kết nối Firebase
+
+//  // Kết nối Firebase
+//     String url = "https://" FIREBASE_HOST "/users/kien.json?auth=" FIREBASE_SECRET;
+//      http_initialized =  http.begin(url);
+//     http.addHeader("Content-Type", "application/json");
+
+
+
+
+    fallQueue = xQueueCreate(5, sizeof(int));// Tạo queue cho trạng thái ngã
+    interruptSemaphore = xSemaphoreCreateBinary();// tạo ngat cho mpu6050
+    buzzerSemaphore = xSemaphoreCreateBinary(); // Tạo semaphore cho buzzer
+
+
+    // Cấu hình ngắt ngoài
+    pinMode(INTERRUPT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt_mpu6050, FALLING);
+    pinMode(buzzerPinInterupt, INPUT_PULLDOWN); 
+    attachInterrupt(digitalPinToInterrupt(buzzerPinInterupt), handleInterrupt_buzzer, RISING); // Ngắt cho buzzer
+
+
+    
+    // Tạo Task
+  xTaskCreate(wifiTask, "WiFi Task", 8192, NULL, 4, &wifiTaskHandle);
+  xTaskCreate(detectFallTask, "Detect Fall", 4096, NULL, 3, &detectFallTaskHandle);
+  xTaskCreate(sendDataTask, "Send Data", 4096, NULL, 1, &sendDataTaskHandle);
+  xTaskCreate(measureHeart_Spo2, "Measure Fall", 4096, NULL, 2, &measureHeartSpo2TaskHandle);
+  xTaskCreate(stopWarning, "Stop Warning", 4096, NULL, 1, NULL);
+  // xTaskCreate(sleepTask, "Sleep Task", 2048, NULL, 2, &sleepTaskHandle);
+}
+
+void loop() {
+    vTaskDelete(NULL);
+}
+
+
+// ==== Task WiFi ====
+void wifiTask(void* pvParameters) {
+  int retryCount = 0;
+ printf("dang thuc hien task kiem tra wifi...\n");
+  while (true) {
+    if(statuspin()<= 20){
+      digitalWrite(STATUS_PIN,HIGH);
+    }
+    if(STATUS_PIN > 20 ){
+      digitalWrite(STATUS_PIN,LOW);
+    }
+    if (credentialsReady) {
+      WiFi.begin(receivedSSID.c_str(), receivedPASS.c_str());
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      Serial.printf("[WiFi] Connecting to: %s\n", receivedSSID.c_str());
+
+      unsigned long startAttempt = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+        delay(500);
+        Serial.print(".");
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("\n[WiFi] Connected. IP: ");
+        Serial.println(WiFi.localIP());
+        wifiConnected = true;
+        credentialsReady = false;
+      
+        retryCount = 0;
+        startBuzzer(126); // Buzzer kêu khi kết nối thành công
+        delay(500);
+        stopBuzzer(); // Tắt âm thanh
+        
+        pCharacteristic->setValue("WIFI_OK");
+        pCharacteristic->notify();
+         
+        stopBLE(); // tắt BLE khi WiFi đã kết nối
+       
+       
+      } else {
+        Serial.println("\n[WiFi] Failed");
+        pCharacteristic->setValue("WIFI_FAIL");
+        pCharacteristic->notify();
+        credentialsReady = false;
+        wifiConnected = false;
+        startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+        delay(300);
+        startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+        delay(300);
+        startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+      }
+    }
+
+    // Check trạng thái WiFi định kỳ
+    if (WiFi.status() != WL_CONNECTED) {
+      retryCount++;
+      if (wifiConnected && retryCount == 2 ) { // ~10 giây mất WiFi
+        Serial.println("[WiFi] Lost connection for 10s. Re-enable BLE...");
+        wifiConnected = false;
+        startBLE();
+        retryCount = 0;
+          startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+        delay(300);
+        startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+        delay(300);
+        startBuzzer(126); // Buzzer kêu khi không kết nối được
+        delay(300);
+        stopBuzzer(); // Tắt âm thanh
+      }
+    } else {
+      if(retryCount > 0) {
+        Serial.println("[WiFi] Reconnected!");
+        startBuzzer(126); // Buzzer kêu khi kết nối lại
+        delay(500);
+        stopBuzzer(); // Tắt âm thanh
+      }
+      retryCount = 0; // Reset nếu đã kết nối lại
+      wifiConnected = true;
+       
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(27000)); // Kiểm tra mỗi 2 giây
+    xEventGroupSetBits(taskDone, TASK_WIFI_BIT);
+
+   }
+  }
+
+// Task 4: Đo nhịp tim và SPO2
+
+void measureHeart_Spo2(void *parameter) {
+    while (1) {
+       printf("Đang đo SPO2 và nhịp tim...\n");
+            particleSensor.heartrateAndOxygenSaturation(/**SPO2=*/&data.SPO2, /**SPO2Valid=*/&SPO2Valid, /**heartRate=*/&data.heartRate, /**heartRateValid=*/&heartRateValid);
+            xQueueOverwrite(dataQueue, &data); // Gửi dữ liệu vào queue
+
+        vTaskDelay(pdMS_TO_TICKS(3000)); // Đợi 28 giây trước khi đo lại
+         xEventGroupSetBits(taskDone, TASK_MEASURESENSOR_BIT);
+
+    }
+  }
+
+// Task 1: Phát hiện ngã
+void detectFallTask(void *parameter) {
+    while (1) {
+        // Chờ ngắt để bắt đầu xử lý
+        if (xSemaphoreTake(interruptSemaphore, portMAX_DELAY) == pdTRUE) {
+         
+            // Thực hiện xử lý sau khi có ngắt
+            sensors_event_t a, g, t;
+            mpu.getEvent(&a, &g, &t);
+
+            float ax = a.acceleration.x;
+            float ay = a.acceleration.y;
+            float az = a.acceleration.z;
+            G_x2 = g.gyro.x;
+            G_y2 = g.gyro.y;
+            G_z2 = g.gyro.z;
+
+            acc = sqrt(ax * ax + ay * ay + az * az);
+
+            // accel_roll = atan2(ay, sqrt(ax * ax + az * az)) * 180 / PI;
+            // accel_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180 / PI;
+
+
+
+            // angleX_t = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+            // angleY_t = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+            // vTaskDelay(pdMS_TO_TICKS(200)); // Giữ task lại một chút trước khi đo lần 2
+
+            // // Đo lần 2
+            // sensors_event_t a_2, g_2;
+            // mpu.getEvent(&a_2, &g_2, &t);
+            // mpu.getMotionInterruptStatus(); // Đọc trạng thái ngắt chuyển động( mục đích để xóa cờ ngắt)
+
+            // float ax2 = a_2.acceleration.x;
+            // float ay2 = a_2.acceleration.y;
+            // float az2 = a_2.acceleration.z;
+
+            // acc = sqrt(ax2 * ax2 + ay2 * ay2 + az2 * az2);
+            // accel_roll = atan2(ay2, sqrt(ax2 * ax2 + az2 * az2)) * 180 / PI; //don vi ra độ
+            // accel_pitch = atan2(-ax2, sqrt(ay2 * ay2 + az2 * az2)) * 180 / PI;
+
+            //  G_x2 = g_2.gyro.x ;
+            //  G_y2 = g_2.gyro.y ;
+
+            // float angleX_s = angleX_t + G_x2 * dt;
+            // float angleY_s = angleY_t + G_y2 * dt;
+                Serial.print("\ngyro_x: ");
+                Serial.print(G_x2, 2);  
+                Serial.print(" \ngyro_y: ");
+                Serial.print(G_y2, 2);
+                Serial.print("\ngyro_z: ");
+                Serial.print(G_z2, 2);
+            // angle_x = 0.98 * angleX_s + 0.02 * accel_roll;
+            // angle_y = 0.98 * angleY_s + 0.02 * accel_pitch;
+
+       
+            // Serial.print("acc: ");
+            // Serial.print(acc, 2);
+            // Serial.print(" angle_x: ");
+            // Serial.print(angle_x, 2);
+            // Serial.print(" angle_y: ");
+            // Serial.println(angle_y, 2);
+            mpu.getMotionInterruptStatus(); // Đọc trạng thái ngắt chuyển động( mục đích để xóa cờ ngắt)
+            if (acc > 14.0 && (abs(G_x2) > 1.4 || abs(G_y2) > 2.0  || abs(G_z2) > 2.0)) {
+                     fallStatus = 1; // Ngã
+                      sendMQTTData(data.SPO2, data.heartRate,fallStatus);
+                    Serial.println("Fall detected!");
+                    startBuzzer(126); // Buzzer kêu
+                  
+                }
+            xQueueSend(fallQueue, (const void*)&fallStatus, 0);
+
+            // Reset trạng thái để vòng lặp sau chờ ngắt mới
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
+// Task 3: Dừng phát âm thanh cảnh báo
+void stopWarning(void *parameter) {
+    while (1) {
+         if (xSemaphoreTake(buzzerSemaphore, portMAX_DELAY) == pdTRUE) {
+            unsigned long pressStart = millis();
+            bool longPressHandled = false;
+
+            while (digitalRead(buzzerPinInterupt) == HIGH) {
+                if (!longPressHandled && (millis() - pressStart >= 3000)) {
+                    longPressHandled = true;
+
+                    if (sensorState) {
+                        Serial.println("Giữ 3s – Tắt cảm biến và cho ESP32 ngủ (chỉ wake bằng nút)");
+                        initMax30102(false);
+                        initMPU6050(false);
+                        sensorState = false;
+                        sleepByButton = true;
+   // Suspend tất cả các task
+                        vTaskSuspend(wifiTaskHandle);
+                        vTaskSuspend(detectFallTaskHandle);
+                        vTaskSuspend(sendDataTaskHandle);
+                        vTaskSuspend(measureHeartSpo2TaskHandle);
+                         startBuzzer(126); 
+                        delay(1300);
+                       stopBuzzer();
+
+                    } else {
+                        Serial.println("Giữ 3s – Bật lại cảm biến");
+                        initMax30102(true);
+                        initMPU6050(true);
+                        sensorState = true;
+
+                      
+                         
+
+                        //    // Resume tất cả các task
+                        vTaskResume(wifiTaskHandle);
+                        vTaskResume(detectFallTaskHandle);
+                        vTaskResume(sendDataTaskHandle);
+                        vTaskResume(measureHeartSpo2TaskHandle);
+                         startBuzzer(126); 
+                         delay(300);
+                        stopBuzzer();
+                    }
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(50));  // tránh chiếm CPU
+            }
+
+            // Khi nhả nút, reset trạng thái cảnh báo
+            stopBuzzer();
+            fallStatus = 0;
+            xQueueSend(fallQueue, (const void*)&fallStatus, 0);
+        }
+    }
+}
+
+// Task 2: Gửi dữ liệu đến server
+void sendDataTask(void *parameter) {
+    while (1) {
+      
+      
+    
+          // if (WiFi.status() != WL_CONNECTED) {
+          //   Serial.println("⚠️ WiFi mất kết nối, thử kết nối lại...");
+          //   // connectToWiFi();
+          //   // if (!mqttClient.connected()) {
+          //   //   Serial.println("⚠️ MQTT ngắt kết nối, thử kết nối lại...");
+          //   //   connectToMQTT();
+          //   // }
+          // }
+        if (WiFi.status() == WL_CONNECTED) {
+            if (!mqttClient.connected()) {
+               connectToMQTT(); // Kết nối lại nếu mất kết nối
+            }
+           
+            
+            // int fallStatus = 0; // Mặc định không có ngã
+            xQueueReceive(fallQueue,  (void*)&fallStatus, 0); // Kiểm tra nếu có dữ liệu trong queue
+            xQueueReceive(dataQueue, (void*)&data, 0); // Kiểm tra nếu có dữ liệu trong queue
+                  sendMQTTData(data.SPO2, data.heartRate,fallStatus);
+
+        }
+        if(fallStatus){
+          vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+        else {
+            // esp_light_sleep_start(); // Bắt đầu sleep
+            vTaskDelay(pdMS_TO_TICKS(8000));
+        
+            // Serial.println("Đã tỉnh lại từ light sleep!");
+            //  xEventGroupSetBits(taskDone, TASK_SEND_DATA_BIT);
+        }
+       
+   
+    }
+}
+// void sleepTask(void *pv) {
+//   // Chờ cho cả 3 task set bit
+//   xEventGroupWaitBits(
+//     taskDone,
+//     ALL_TASKS_DONE,
+//     pdTRUE,        // Clear bit sau khi nhận
+//     pdTRUE,        // Chờ tất cả bit (AND)
+//     portMAX_DELAY  // Chờ vô hạn
+//   );
+
+//   Serial.println("Tất cả task đã hoàn thành. Chuẩn bị ngủ...");
+
+
+//   // Cấu hình RTC timer wake-up
+
+//   // esp_light_sleep_start();          // Vào light sleep
+
+  
+//   Serial.println("Đã tỉnh lại từ light sleep!");
+// }

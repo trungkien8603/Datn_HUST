@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+// Thông số cảm biến MPU6050
+#define FALL_THRESHOLD 5.0   // Ngưỡng rơi tự do (m/s^2)
+#define ANGLE_THRESHOLD 60.0 // Ngưỡng góc nghiêng (độ)
+
+// WiFi & Firebase
+#define WIFI_SSID "Tang 3"
+#define WIFI_PASSWORD "iloveyou"
+#define FIREBASE_SECRET "IurUT7cyMoKG4ZPQj16iZuZLRFQuyoXGfZDY1ywa"
+#define FIREBASE_HOST  "firstproject-f55ec-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+float acc, angle_x = 0, angle_y = 0; // Góc từ gyro
+
+// Cảm biến MPU6050
+Adafruit_MPU6050 mpu;
+
+// Queue để truyền trạng thái ngã
+QueueHandle_t fallQueue;
+SemaphoreHandle_t interruptSemaphore;
+
+#define INTERRUPT_PIN 16  // Chân ngắt bất kỳ
+
+void IRAM_ATTR handleInterrupt() {
+    xSemaphoreGiveFromISR(interruptSemaphore, NULL);
+}
+
+void detectFallTask(void *parameter);
+void sendDataTask(void *parameter);
+
+void setup() {
+    Serial.begin(115200);
+    
+    // Kết nối WiFi
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("WiFi connected");
+
+    // Khởi tạo MPU6050
+    if (!mpu.begin()) {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) { delay(10); }
+    }
+    Serial.println("MPU6050 Found!");
+    //setupt motion detection
+ mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
+ mpu.setMotionDetectionThreshold(100); // 25 LSB = 0.25g
+ mpu.setMotionDetectionDuration(50);
+ mpu.setInterruptPinLatch(true);	// Keep it latched.  Will turn off when reinitialized.
+ mpu.setInterruptPinPolarity(true);
+ mpu.setMotionInterrupt(true);
+ mpu.enableSleep(false);
+ mpu.setClock(MPU6050_PLL_GYROX);
+ mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    
+    // Tạo Queue
+    fallQueue = xQueueCreate(5, sizeof(int));
+    interruptSemaphore = xSemaphoreCreateBinary();
+    
+    // Cấu hình ngắt ngoài
+    pinMode(INTERRUPT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleInterrupt, FALLING);
+    
+    // Tạo Task
+    xTaskCreate(detectFallTask, "Detect Fall", 4096, NULL, 2, NULL);
+    xTaskCreate(sendDataTask, "Send Data", 4096, NULL, 1, NULL);
+}
+
+void loop() {
+    vTaskDelete(NULL);
+}
+
+// Task 1: Phát hiện ngã
+void detectFallTask(void *parameter) {
+    while (1) {
+        // if (xSemaphoreTake(interruptSemaphore, portMAX_DELAY)) {
+            sensors_event_t a, g, t;
+            mpu.getEvent(&a, &g, &t);
+            
+            float alpha = 0.98;
+            unsigned long lastTime = 0;
+            
+            float ax = a.acceleration.x;
+            float ay = a.acceleration.y;
+            float az = a.acceleration.z;
+
+            // Tính góc nghiêng từ accelerometer
+            float accel_roll = atan2(ay, sqrt(ax * ax + az * az)) * 180 / PI;
+            float accel_pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180 / PI;
+             acc = sqrt(ax * ax + ay * ay + az * az);
+
+            float G_x = g.gyro.x * PI / 180.0; // Chuyển đổi độ sang radian
+            float G_y = g.gyro.y * PI / 180.0; // Chuyển đổi độ sang radian
+
+            float angleX = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+            float angleY = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+            
+             // Tính thời gian delta
+             unsigned long currentTime = millis();
+            float dt = (currentTime - lastTime) / 1000.0;
+    
+            lastTime = currentTime;
+
+                // Tính góc từ gyro
+              angle_x += G_x * dt;
+              angle_y += G_y * dt;
+
+             
+        
+            //   bool isFallen = false;
+            //   if (acc > 2.5 || fabs(angle_x) > 45 || fabs(angle_y) > 45) {
+            //     isFallen = true;
+            //   }
+            // xQueueSend(fallQueue, &isFallen, portMAX_DELAY);
+        }
+    }
+// }
+
+// Task 2: Gửi dữ liệu Firebase
+void sendDataTask(void *parameter) {
+    while (1) {
+        if (WiFi.status() == WL_CONNECTED) {
+            HTTPClient http;
+            String url = "https://" FIREBASE_HOST "/users/kien.json?auth=" FIREBASE_SECRET;
+            http.begin(url);
+            http.addHeader("Content-Type", "application/json");
+            
+            int fallStatus = 0; // Mặc định không có ngã
+            xQueueReceive(fallQueue, &fallStatus, 0); // Kiểm tra nếu có dữ liệu trong queue
+            
+            StaticJsonDocument<200> doc;
+            // doc["heartRate"] = random(60, 100);
+            // doc["spo2"] = random(95, 100);
+            // doc["fallStatus"] = fallStatus;
+            doc["acc"] = acc;
+            doc["angle_x"] =angle_x;
+            doc["angle_y"] =angle_y;
+            String jsonStr;
+            serializeJson(doc, jsonStr);
+            
+            int httpResponseCode = http.PUT(jsonStr);
+            Serial.println(httpResponseCode > 0 ? "Data sent successfully!" : "Failed to send data.");
+            http.end();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}

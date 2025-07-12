@@ -1,0 +1,535 @@
+import 'dart:typed_data';
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  print("Firebase initialized successfully");
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Health Monitor',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        textTheme: GoogleFonts.latoTextTheme(),
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  FlutterBluePlus flutterBlue = FlutterBluePlus();
+  bool wifiConnected = false;
+  bool wifiStatusVisible = false;
+  String userName = 'Nguyen Trung Kien';
+  int userAge = 22;
+  int heartRate = 0;
+  int spo2 = 0;
+  bool fallStatus = false;
+
+  BluetoothDevice? selectedDevice;
+  BluetoothCharacteristic? heartRateCharacteristic;
+
+  @override
+  void initState() {
+    super.initState();
+    loadUserName();
+    fetchUserData();
+  }
+
+  Future<void> loadUserName() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    setState(() {
+      userName = prefs.getString('userName') ?? 'Nguyen Trung Kien';
+      userAge = prefs.getInt('userAge') ?? 22; // 👈 giá trị mặc định nếu chưa có
+    });
+  }
+
+  void fetchUserData() {
+    DatabaseReference dbRef = FirebaseDatabase.instance.ref("users/kien");
+    dbRef.onValue.listen((DatabaseEvent event) {
+      if (event.snapshot.exists) {
+        try {
+          final data = event.snapshot.value as Map;
+          setState(() {
+            heartRate = int.tryParse(data['heartRate'].toString()) ?? 0;
+            spo2 = int.tryParse(data['spo2'].toString()) ?? 0;
+            fallStatus = int.tryParse(data['fallStatus'].toString()) == 1;
+          });
+        } catch (e) {
+          print("Error processing Firebase data: $e");
+        }
+      }
+    });
+  }
+
+  void _editUserInfo() {
+    TextEditingController nameController = TextEditingController(text: userName);
+    TextEditingController ageController = TextEditingController(text: userAge.toString());
+    TextEditingController ssidController = TextEditingController();
+    TextEditingController passwordController = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: LayoutBuilder( // ✅ dùng LayoutBuilder để tính toán không gian
+            builder: (context, constraints) {
+              return ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.8,
+                  maxWidth: MediaQuery.of(context).size.width * 0.9,
+                ),
+                child: SingleChildScrollView( // ✅ cho phép cuộn toàn bộ dialog khi tràn
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('Settings', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: nameController,
+                        decoration: const InputDecoration(labelText: 'Name'),
+                      ),
+                      TextField(
+                        controller: ageController,
+                        decoration: const InputDecoration(labelText: 'Age'),
+                        keyboardType: TextInputType.number,
+                      ),
+                      TextField(
+                        controller: ssidController,
+                        decoration: const InputDecoration(labelText: 'WiFi SSID'),
+                      ),
+                      TextField(
+                        controller: passwordController,
+                        decoration: const InputDecoration(labelText: 'WiFi Password'),
+                        obscureText: true,
+                      ),
+                      const SizedBox(height: 24),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Cancel'),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: () async {
+                              setState(() {
+                                userName = nameController.text.trim();
+                                userAge = int.tryParse(ageController.text.trim()) ?? userAge;
+                              });
+                              SharedPreferences prefs = await SharedPreferences.getInstance();
+                              await prefs.setString('userName', userName);
+                              await prefs.setInt('userAge', userAge);
+
+                              if (selectedDevice != null) {
+                                sendWiFiCredentials(ssidController.text, passwordController.text);
+                              }
+                              Navigator.pop(context);
+                            },
+                            child: const Text('Save & Connect'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+
+  }
+
+  StreamSubscription<List<int>>? bleConnectionSubscription;
+  StreamSubscription<List<int>>? wifiResponseSubscription;
+
+
+  Future<void> requestPermissions() async {
+    await [
+      Permission.bluetooth,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+  }
+
+  Future<void> scanAndConnect() async {
+    await requestPermissions();
+
+    setState(() {}); // để rebuild lại nếu cần
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text("Scanning..."),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: const [
+              CircularProgressIndicator(),
+              SizedBox(height: 10),
+              Text("Scanning for nearby BLE devices..."),
+            ],
+          ),
+        );
+      },
+    );
+
+    List<ScanResult> scanResults = [];
+
+    // Dừng quét cũ (nếu có)
+    await FlutterBluePlus.stopScan();
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+
+    // Lấy kết quả quét xong thì hiển thị
+    FlutterBluePlus.scanResults.listen((results) async {
+      scanResults = results;
+    });
+
+    // Chờ 4 giây rồi đóng dialog loading và mở danh sách thiết bị
+    await Future.delayed(const Duration(seconds: 4));
+    Navigator.pop(context); // tắt dialog "Scanning..."
+
+    if (scanResults.isEmpty) {
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text("No devices found"),
+          content: const Text("Please try again or check your BLE device."),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text("OK"))
+          ],
+        ),
+      );
+      return;
+    }
+
+    // Hiển thị danh sách thiết bị quét được
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text("Select Device"),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: scanResults.length,
+              itemBuilder: (context, index) {
+                final result = scanResults[index];
+                final device = result.device;
+
+                return ListTile(
+                  title: Text(device.platformName.isNotEmpty ? device.name : "Unknown"),
+                  subtitle: Text("ID: ${device.id} | RSSI: ${result.rssi}"),
+                  onTap: () async {
+                    FlutterBluePlus.stopScan();
+                    Navigator.pop(context);
+                    setState(() => selectedDevice = device);
+
+                    try {
+                      await device.connect(autoConnect: false);
+                      final services = await device.discoverServices();
+
+                      for (var s in services) {
+                        for (var c in s.characteristics) {
+                          if (c.properties.write) {
+                            heartRateCharacteristic = c;
+                          } else if (c.properties.notify || c.properties.read) {
+
+
+                            // Hủy đăng ký cũ nếu có
+                            await bleConnectionSubscription?.cancel();
+
+                            await c.setNotifyValue(true);
+                            // Lắng nghe BLE phản hồi khi kết nối
+                            bleConnectionSubscription = c.lastValueStream.listen((value) {
+                              final response = utf8.decode(value).trim();
+                              print("BLE Response: [$response]");
+
+                              if (response.contains("CONNECTED")) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text("BLE Device Connected Successfully")),
+                                );
+                              }
+                            });
+                          }
+                        }
+                      }
+
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text("Connected to ${device.platformName}")),
+                      );
+                    } catch (e) {
+                      print("Connection error: $e");
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void sendWiFiCredentials(String ssid, String password) async {
+    if (selectedDevice != null && heartRateCharacteristic != null) {
+      final data = "SSID:$ssid;PASS:$password";
+      try {
+        await heartRateCharacteristic!.write(utf8.encode(data));
+        print("WiFi credentials sent: $data");
+
+        // await heartRateCharacteristic!.setNotifyValue(true);
+        // Hủy lắng nghe cũ nếu có
+        await wifiResponseSubscription?.cancel();
+
+        // Lắng nghe phản hồi từ thiết bị BLE
+        wifiResponseSubscription = heartRateCharacteristic!.lastValueStream.listen((value) {
+          print("Raw response bytes: $value");
+          final response = utf8.decode(value).trim();
+          print("WiFi Response: [$response]");
+
+          // So sánh xem phản hồi có đúng ssid & password không
+          if (response.contains("SSID:$ssid") && response.contains("PASS:$password")) {
+            showConnectedStatus(true);  // thành công
+          } else {
+            showConnectedStatus(false); // thất bại hoặc khác thông tin
+          }
+        });
+
+        // Tự động hủy sau 10 giây
+        Future.delayed(const Duration(seconds: 10), () {
+          wifiResponseSubscription?.cancel();
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar( content: Text('OFF BLE'),
+            ),
+          );
+        });
+
+      } catch (e) {
+        print("Failed to send credentials or listen: $e");
+      }
+    } else {
+      print("Bluetooth device or characteristic not available");
+    }
+  }
+
+
+  void showConnectedStatus(bool success) {
+    setState(() {
+      wifiConnected = success;
+      wifiStatusVisible = true;
+    });
+
+    // Hiện snackbar trong 3 giây
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          success ? "WiFi Connected Successfully!" : "WiFi Connection Failed",
+        ),
+        backgroundColor: success ? Colors.green : Colors.red,
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+
+    // Sau 3 giây ẩn icon
+    Future.delayed(const Duration(seconds: 4), () {
+      setState(() {
+        wifiStatusVisible = false;
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    bleConnectionSubscription?.cancel();
+    wifiResponseSubscription?.cancel();
+    super.dispose();
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Monitor Health', style: GoogleFonts.lato(fontWeight: FontWeight.bold, fontSize: 22)),
+        centerTitle: true,
+        backgroundColor: Colors.blueAccent,
+      ),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: constraints.maxHeight),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Column(
+                      children: [
+                        InfoUserTile(text: userName, icon: Icons.person),
+                        const SizedBox(height: 10),
+                        InfoUserTile(text: 'Age: $userAge', icon: Icons.calendar_today),
+                        const SizedBox(height: 20),
+                        Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            Container(
+                              width: 320,
+                              height: 320,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                gradient: LinearGradient(
+                                  colors: fallStatus ? [Colors.redAccent, Colors.red] : [Colors.blueAccent, Colors.lightBlueAccent],
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                ),
+                              ),
+                            ),
+                            Column(
+                              children: [
+                                HealthInfoTile(
+                                  title: 'Fall Status',
+                                  value: fallStatus ? 'DANGER' : 'SAFE',
+                                  icon: Icons.safety_check,
+                                  color: fallStatus ? Colors.red : Colors.green,
+                                ),
+                                HealthInfoTile(
+                                  title: 'SpO₂',
+                                  value: '$spo2%',
+                                  icon: Icons.bubble_chart,
+                                  color: Colors.white,
+                                ),
+                                HealthInfoTile(
+                                  title: 'Heart Rate',
+                                  value: '$heartRate bpm',
+                                  icon: Icons.favorite,
+                                  color: Colors.red,
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    Column(
+                      children: [
+                        const SizedBox(height: 20),
+                        ElevatedButton(
+                          onPressed: scanAndConnect,
+                          child: const Text("Scan Bluetooth Devices"),
+                        ),
+                        const SizedBox(height: 10),
+                        ElevatedButton(
+                          onPressed: _editUserInfo,
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.all(20),
+                            shape: const CircleBorder(),
+                            backgroundColor: Colors.blueAccent,
+                          ),
+                          child: const Icon(Icons.settings, size: 40, color: Colors.white),
+                        ),
+                        const SizedBox(height: 20),
+                        if (wifiStatusVisible)
+                          AnimatedOpacity(
+                            opacity: 1.0,
+                            duration: const Duration(milliseconds: 500),
+                            child: Icon(
+                              wifiConnected ? Icons.check_circle : Icons.error,
+                              color: wifiConnected ? Colors.green : Colors.red,
+                              size: 48,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+
+    );
+  }
+}
+
+class InfoUserTile extends StatelessWidget {
+  final String text;
+  final IconData icon;
+  const InfoUserTile({super.key, required this.text, required this.icon});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 50,
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.grey[800],
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, color: Colors.white, size: 24),
+          const SizedBox(width: 10),
+          Text(text, style: GoogleFonts.lato(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 20)),
+        ],
+      ),
+    );
+  }
+}
+
+class HealthInfoTile extends StatelessWidget {
+  final String title;
+  final String value;
+  final IconData icon;
+  final Color color;
+  const HealthInfoTile({super.key, required this.title, required this.value, required this.icon, required this.color});
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color, size: 30),
+          const SizedBox(width: 10),
+          Text('$title: ', style: GoogleFonts.lato(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
+          Text(value, style: GoogleFonts.lato(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
+        ],
+      ),
+    );
+  }
+}

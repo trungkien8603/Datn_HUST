@@ -1,0 +1,144 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+const char* ssid = "kientrung";
+const char* password = "08062003";
+
+WebServer server(80);
+Adafruit_MPU6050 mpu;
+
+float G_x2, G_y2, G_z2, acc;
+
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>MPU6050 Real-Time Graph</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.0"></script>
+</head>
+<body>
+  <h2>MPU6050 Real-Time Graph</h2>
+  <canvas id="chart" width="800" height="400"></canvas>
+  <br>
+  <button onclick="chart.resetZoom()">Reset Zoom</button>
+  <script>
+    const labels = [];
+    const acc = [], gx = [], gy = [], gz = [];
+
+    const ctx = document.getElementById('chart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'acc', data: acc, borderColor: 'red', fill: false },
+          { label: 'gyroX', data: gx, borderColor: 'blue', fill: false },
+          { label: 'gyroY', data: gy, borderColor: 'green', fill: false },
+          { label: 'gyroZ', data: gz, borderColor: 'purple', fill: false }
+        ]
+      },
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          zoom: {
+            pan: {
+              enabled: true,
+              mode: 'x',
+              modifierKey: 'ctrl'
+            },
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: 'x'
+            }
+          }
+        },
+        scales: {
+          x: { title: { display: true, text: 'Time' } },
+          y: { title: { display: true, text: 'Sensor Value' } }
+        }
+      }
+    });
+
+    setInterval(() => {
+      fetch('/data')
+        .then(res => res.json())
+        .then(obj => {
+          const time = new Date().toLocaleTimeString();
+          labels.push(time);
+          acc.push(obj.acc);
+          gx.push(obj.gx);
+          gy.push(obj.gy);
+          gz.push(obj.gz);
+
+          if (labels.length > 50) {
+            labels.shift();
+            acc.shift();
+            gx.shift();
+            gy.shift();
+            gz.shift();
+          }
+
+          chart.update();
+        });
+    }, 500);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", htmlPage);
+}
+
+void handleData() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  G_x2 = g.gyro.x;
+  G_y2 = g.gyro.y;
+  G_z2 = g.gyro.z+4.37;
+
+  acc = sqrt(ax * ax + ay * ay + az * az);
+
+  String json = "{\"acc\":" + String(acc, 2) +
+                ",\"gx\":" + String(G_x2, 2) +
+                ",\"gy\":" + String(G_y2, 2) +
+                ",\"gz\":" + String(G_z2, 2) + "}";
+
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!mpu.begin()) {
+    Serial.println("Không tìm thấy MPU6050!");
+    while (1) delay(10);
+  }
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected: " + WiFi.localIP().toString());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
