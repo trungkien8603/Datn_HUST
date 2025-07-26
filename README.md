@@ -39,7 +39,8 @@ A **wearable device** designed to monitor vital health data and detect falls in 
 - Optimize battery usage
 - Improve fall detection accuracy with AI models
 
-## 📷 Screenshots
+## 📷 Product Imange
+![Product Imange](https://github.com/trungkien8603/Datn_HUST/blob/main/photo_2025-07-26_11-05-56.jpg)
 
 
 
